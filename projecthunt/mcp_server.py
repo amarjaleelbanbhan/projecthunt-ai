@@ -1,10 +1,14 @@
 """Local MCP tools calling the same REST API. No outreach send tool exists."""
 import os
 import httpx
+from uuid import UUID
 from mcp.server.fastmcp import FastMCP
 
 mcp=FastMCP('projecthunt-ai')
 BASE=os.environ.get('PROJECTHUNT_API_BASE','http://127.0.0.1:8000').rstrip('/')
+
+def safe_id(value:str)->str:
+    return str(UUID(value))
 
 def request(method,path,*,data=None,files=None):
     key=os.environ.get('PROJECTHUNT_API_KEY')
@@ -27,7 +31,7 @@ def search_prospects()->list[dict]:
 @mcp.tool()
 def audit_website(prospect_id:str)->dict:
     """Audit a selected sourced prospect's public website and save static HTML findings."""
-    return request('POST',f'/prospects/{prospect_id}/audit')
+    return request('POST',f'/prospects/{safe_id(prospect_id)}/audit')
 
 @mcp.tool()
 def get_opportunities()->list[dict]:
@@ -37,17 +41,17 @@ def get_opportunities()->list[dict]:
 @mcp.tool()
 def prepare_proposal(prospect_id:str,capabilities:list[str])->dict:
     """Generate scope from confirmed findings matching the user's stated metadata/accessibility capability."""
-    return request('POST',f'/prospects/{prospect_id}/scope',data={'capabilities':capabilities})
+    return request('POST',f'/prospects/{safe_id(prospect_id)}/scope',data={'capabilities':capabilities})
 
 @mcp.tool()
 def review_contact(prospect_id:str,source_url:str)->dict:
     """Attest that the existing CSV contact address was personally observed at a source URL; this does not verify delivery."""
-    return request('POST',f'/prospects/{prospect_id}/contact-review',data={'source_url':source_url})
+    return request('POST',f'/prospects/{safe_id(prospect_id)}/contact-review',data={'source_url':source_url})
 
 @mcp.tool()
 def create_email_draft(prospect_id:str)->dict:
     """Prepare a local email draft after contact review and suppression checks. No email is sent."""
-    return request('POST',f'/prospects/{prospect_id}/draft')
+    return request('POST',f'/prospects/{safe_id(prospect_id)}/draft')
 
 @mcp.tool()
 def suppress_contact(email:str,reason:str='opt_out')->dict:

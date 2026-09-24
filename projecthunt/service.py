@@ -1,23 +1,25 @@
 """ProjectHunt v0.2: sourced prospects, reproducible audits, and review-only outreach."""
 from __future__ import annotations
 import csv
+import http.client
 import io
 import ipaddress
 import json
 import re
 import socket
-from datetime import datetime, timezone
+import ssl
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
-import httpx
 from bs4 import BeautifulSoup
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, func, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, create_engine, func, select, update, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 EMAIL = re.compile(r"^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$")
 USER_AGENT = "ProjectHuntAI/0.2 (+https://amarjaleel.me)"
 MAX_HTML = 1_000_000
+MAX_AUDITS_PER_HOUR = 20
 
 class Base(DeclarativeBase): pass
 
@@ -73,17 +75,33 @@ class Event(Base):
 
 class ProjectHuntError(ValueError): pass
 
-def validate_public_url(url: str, resolver=socket.getaddrinfo) -> str:
-    parts=urlsplit(url)
-    if parts.scheme not in ('http','https') or not parts.hostname or parts.username or parts.password or parts.port not in (None,80,443):
-        raise ProjectHuntError('URL must be public HTTP(S) with no credentials or custom port')
+def validate_public_url(url: str, resolver=None) -> tuple[str,int,str,str]:
+    """Resolve once; return a validated address for the *actual* socket connection."""
+    if not isinstance(url,str) or len(url)>2048 or any(ch in url for ch in ('\\','\r','\n','\t')):
+        raise ProjectHuntError('invalid audit URL')
     try:
-        addresses=resolver(parts.hostname, parts.port or (443 if parts.scheme=='https' else 80), type=socket.SOCK_STREAM)
-        if not addresses or any(not ipaddress.ip_address(entry[4][0]).is_global for entry in addresses):
+        parts=urlsplit(url)
+        port=parts.port or (443 if parts.scheme=='https' else 80)
+        host=parts.hostname
+        if (parts.scheme not in ('http','https') or not host or parts.username or parts.password
+                or parts.port not in (None,80,443) or parts.fragment or host.endswith('.')):
+            raise ProjectHuntError('URL must be public HTTP(S) with no credentials, fragment or custom port')
+        host=host.encode('idna').decode('ascii').lower()
+        try:
+            literal=ipaddress.ip_address(host)
+        except ValueError:
+            literal=None
+        if literal and not literal.is_global: raise ProjectHuntError('non-public network address')
+        if host in ('localhost','localhost.localdomain') or host.endswith(('.local','.internal','.localhost')):
+            raise ProjectHuntError('internal hostname')
+        resolver=resolver or socket.getaddrinfo
+        addresses=resolver(host,port,type=socket.SOCK_STREAM)
+        ips={entry[4][0] for entry in addresses}
+        if not ips or any(not ipaddress.ip_address(ip).is_global for ip in ips):
             raise ProjectHuntError('non-public network address')
-    except (socket.gaierror,ValueError) as exc:
-        raise ProjectHuntError('domain cannot be resolved to public addresses') from exc
-    return url
+        return host,port,sorted(ips)[0],parts.path or '/'
+    except (socket.gaierror,UnicodeError,ValueError) as exc:
+        raise ProjectHuntError('audit URL does not resolve exclusively to public addresses') from exc
 
 def domain_of(url: str) -> str:
     parts=urlsplit(url)
@@ -105,22 +123,30 @@ def audit_html(url: str, html: str, status_code: int=200):
     return {'url':url,'status_code':status_code,'findings':result,'limitations':['Static HTML only; no rendered layout, broken-link crawl, performance or form submission'],'audited_at':datetime.now(timezone.utc).isoformat()}
 
 def fetch_audit(url: str):
-    # Revalidate DNS before request and block redirects; production deployment also needs network egress controls.
-    validate_public_url(url)
+    host,port,pinned_ip,_=validate_public_url(url)
+    parts=urlsplit(url)
+    conn=(http.client.HTTPSConnection(host,port,timeout=5,context=ssl.create_default_context())
+          if parts.scheme=='https' else http.client.HTTPConnection(host,port,timeout=5))
+    # http.client uses `host` for Host, SNI and certificate validation, while the
+    # socket connects to the previously validated address. No proxy or DNS relookup.
+    conn._create_connection=lambda address,timeout,source_address=None: socket.create_connection(
+        (pinned_ip,port),timeout,source_address)
     try:
-        with httpx.Client(follow_redirects=False,timeout=8,headers={'User-Agent':USER_AGENT},trust_env=False) as client:
-            with client.stream('GET',url) as response:
-                if response.is_redirect: raise ProjectHuntError('redirect blocked; audit target separately')
-                if response.status_code>=400: raise ProjectHuntError(f'HTTP {response.status_code}')
-                if 'text/html' not in response.headers.get('content-type',''): raise ProjectHuntError('not an HTML response')
-                chunks=[]; size=0
-                for chunk in response.iter_bytes():
-                    size+=len(chunk)
-                    if size>MAX_HTML: raise ProjectHuntError('HTML exceeds 1 MB')
-                    chunks.append(chunk)
-                return audit_html(url,b''.join(chunks).decode('utf-8','replace'),response.status_code)
-    except httpx.HTTPError as exc:
+        conn.request('GET',(parts.path or '/')+('?' + parts.query if parts.query else ''),
+                     headers={'User-Agent':USER_AGENT,'Accept-Encoding':'identity'})
+        response=conn.getresponse()
+        if 300<=response.status<400: raise ProjectHuntError('redirect blocked; audit target separately')
+        if response.status>=400: raise ProjectHuntError(f'HTTP {response.status}')
+        if 'text/html' not in response.getheader('Content-Type','').lower(): raise ProjectHuntError('not an HTML response')
+        declared=response.getheader('Content-Length')
+        if declared and declared.isdigit() and int(declared)>MAX_HTML: raise ProjectHuntError('HTML exceeds 1 MB')
+        body=response.read(MAX_HTML+1)
+        if len(body)>MAX_HTML: raise ProjectHuntError('HTML exceeds 1 MB')
+        return audit_html(url,body.decode('utf-8','replace'),response.status)
+    except (OSError,http.client.HTTPException,ssl.SSLError) as exc:
         raise ProjectHuntError(f'website request failed: {type(exc).__name__}') from exc
+    finally:
+        conn.close()
 
 class ProjectHunt:
     def __init__(self, database_url: str):
@@ -134,9 +160,10 @@ class ProjectHunt:
         for row in rows:
             try:
                 name=(row.get('name') or '').strip(); url=(row.get('website') or '').strip(); source=(row.get('source_url') or '').strip()
-                if not name or not source or urlsplit(source).scheme not in ('http','https'): raise ProjectHuntError('missing name or source')
+                if not name or len(name)>300 or len(url)>2048 or len(source)>2048 or not source or urlsplit(source).scheme not in ('http','https'): raise ProjectHuntError('invalid name, website or source')
                 dom=domain_of(url); email=(row.get('email') or '').strip().lower() or None
-                if email and not EMAIL.fullmatch(email): raise ProjectHuntError('invalid contact')
+                if email and (len(email)>320 or not EMAIL.fullmatch(email)): raise ProjectHuntError('invalid contact')
+                if len(row.get('location') or '')>300 or len(row.get('industry') or '')>200: raise ProjectHuntError('invalid location or industry')
                 with self.sessions.begin() as db:
                     if db.scalar(select(Prospect.id).where((Prospect.domain==dom)|((func.lower(Prospect.name)==name.lower())&(Prospect.location==(row.get('location') or ''))))):
                         db.add(Event(kind='duplicate',detail=dom)); stats['duplicates']+=1; continue
@@ -157,7 +184,7 @@ class ProjectHunt:
         with self.sessions.begin() as db:
             p=db.get(Prospect,pid)
             if not p: raise ProjectHuntError('prospect not found')
-            if p.status!='Discovered': raise ProjectHuntError('audit already recorded')
+            if p.status not in ('Discovered','Auditing'): raise ProjectHuntError('audit already recorded')
             if report['url']!=p.website: raise ProjectHuntError('audit URL mismatch')
             for item in report['findings']:
                 db.add(Finding(prospect_id=pid,status=item['status'],code=item['code'],description=item['description'],evidence=item['evidence']))
@@ -165,6 +192,21 @@ class ProjectHunt:
             opp=db.scalar(select(Opportunity).where(Opportunity.prospect_id==pid)); opp.stage='Verified'
             db.add(Event(prospect_id=pid,kind='verified',detail=report['url']))
         return report
+    def reserve_audit(self,pid):
+        """One audit per prospect and 20 per hour per single operator."""
+        with self.sessions.begin() as db:
+            if self.engine.dialect.name=='postgresql':
+                db.execute(text('SELECT pg_advisory_xact_lock(8824003)'))
+            cutoff=datetime.now(timezone.utc)-timedelta(hours=1)
+            count=db.scalar(select(func.count()).select_from(Event).where(Event.kind=='audit_started',Event.created_at>=cutoff))
+            if count>=MAX_AUDITS_PER_HOUR: raise ProjectHuntError('audit limit reached; retry after one hour')
+            changed=db.execute(update(Prospect).where(Prospect.id==pid,Prospect.status=='Discovered').values(status='Auditing'))
+            if changed.rowcount!=1: raise ProjectHuntError('prospect unavailable or audit already started')
+            db.add(Event(prospect_id=pid,kind='audit_started',detail='one public HTML request'))
+    def fail_audit(self,pid,error):
+        with self.sessions.begin() as db:
+            db.execute(update(Prospect).where(Prospect.id==pid,Prospect.status=='Auditing').values(status='Discovered'))
+            db.add(Event(prospect_id=pid,kind='audit_failed',detail=str(error)[:100]))
     def findings(self,pid):
         with self.sessions() as db:
             return [{'id':f.id,'status':f.status,'code':f.code,'description':f.description,'evidence':f.evidence} for f in db.scalars(select(Finding).where(Finding.prospect_id==pid)).all()]

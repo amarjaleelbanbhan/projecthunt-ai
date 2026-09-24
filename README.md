@@ -1,4 +1,4 @@
-# ProjectHunt AI 0.2.0
+# ProjectHunt AI 0.3 development
 
 Local, single-operator prospect review service by Amar Jaleel / Amar Digital Systems. No paid AI API is required. **No email is sent.** Every prospect needs a recorded source URL; contact addresses remain unreviewed until an operator attests to a source. This attestation does not prove email deliverability.
 
@@ -32,4 +32,4 @@ Every API endpoint requires `Authorization: Bearer <PROJECTHUNT_API_KEY>`. API c
 
 ## Tests and limits
 
-`python -m unittest discover -s tests -v` runs API workflow and core tests. CI runs PostgreSQL as a service and checks database persistence. Local test fixtures mock outbound site fetching; no automated test sends mail. The audit uses Beautiful Soup to inspect static HTML title, description, viewport, and image alt attributes. It does not run Lighthouse, axe, JavaScript rendering, broken-link crawling, form submission, or security scans. The URL fetcher blocks nonpublic DNS results and redirects, but DNS rebinding remains possible: keep it local until outbound requests are pinned to validated addresses or isolated by network policy. No multi-user authorization, Gmail OAuth, recipient deliverability check, public deployment, or revenue recording exists. Do not deploy this single-operator bearer-key API on a public network.
+`python -m unittest discover -s tests -v` runs API workflow and core tests. CI runs PostgreSQL as a service and checks database persistence. Local test fixtures mock outbound site fetching; no automated test sends mail. The audit uses Beautiful Soup to inspect static HTML title, description, viewport, and image alt attributes. It does not run Lighthouse, axe, JavaScript rendering, broken-link crawling, form submission, or security scans. The URL fetcher pins each connection to a validated public IP and blocks redirects; add a public-IP-only egress firewall for defense in depth. No multi-user authorization, Gmail OAuth, recipient deliverability check, live ChatGPT connection, public deployment, or revenue recording exists. Do not expose the bearer-key API publicly. See DEPLOYMENT.md for the authenticated remote MCP gateway and remaining setup.

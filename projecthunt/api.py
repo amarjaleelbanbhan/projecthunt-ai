@@ -1,12 +1,31 @@
 """Single-operator local API. Do not expose publicly without user-scoped OAuth."""
 import os
 import secrets
+import threading
+import time
+from collections import defaultdict, deque
 from fastapi import Depends, FastAPI, Header, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from .service import ProjectHunt, ProjectHuntError, fetch_audit
 
-app=FastAPI(title='ProjectHunt AI',version='0.2.0')
+app=FastAPI(title='ProjectHunt AI',version='0.3.0')
 _service=None
+_rate_lock=threading.Lock()
+_requests=defaultdict(deque)
+
+@app.middleware('http')
+async def throttle(request,call_next):
+    # One worker is required; deploy behind an additional gateway limit.
+    identity=request.client.host if request.client else 'unknown'
+    now=time.monotonic()
+    with _rate_lock:
+        q=_requests[identity]
+        while q and q[0]<=now-60: q.popleft()
+        if len(q)>=120:
+            return JSONResponse({'detail':'request limit reached'},status_code=429,headers={'Retry-After':'60'})
+        q.append(now)
+    return await call_next(request)
 
 def service():
     global _service
@@ -47,8 +66,13 @@ def prospect(pid:str,svc:ProjectHunt=Depends(service)): return handle(lambda:svc
 def audit(pid:str,svc:ProjectHunt=Depends(service)):
     def run():
         p=svc.get(pid)
-        report=fetch_audit(p['website'])
-        return svc.save_audit(pid,report)
+        svc.reserve_audit(pid)
+        try:
+            report=fetch_audit(p['website'])
+            return svc.save_audit(pid,report)
+        except Exception as exc:
+            svc.fail_audit(pid,exc)
+            raise
     return handle(run)
 
 @app.get('/prospects/{pid}/findings',dependencies=[Depends(auth)])

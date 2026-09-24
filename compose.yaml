@@ -5,9 +5,34 @@ services:
       DATABASE_URL: postgresql+psycopg://projecthunt:${POSTGRES_PASSWORD:?set password}@db:5432/projecthunt
       PROJECTHUNT_API_KEY: ${PROJECTHUNT_API_KEY:?set API key}
     ports: ["127.0.0.1:8000:8000"]
+    read_only: true
+    tmpfs: ["/tmp:noexec,nosuid,size=32m"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    pids_limit: 128
+    networks: ["backend", "outbound"]
     depends_on:
       db:
         condition: service_healthy
+  mcp:
+    profiles: ["remote"]
+    build: .
+    command: ["uvicorn","projecthunt.remote_mcp:create_app","--factory","--host","0.0.0.0","--port","8001"]
+    environment:
+      PROJECTHUNT_API_BASE: http://api:8000
+      PROJECTHUNT_API_KEY: ${PROJECTHUNT_API_KEY:?set API key}
+      OAUTH_ISSUER: ${OAUTH_ISSUER:-}
+      JWT_JWKS_URL: ${JWT_JWKS_URL:-}
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-}
+      PROJECTHUNT_OWNER_SUB: ${PROJECTHUNT_OWNER_SUB:-}
+    ports: ["127.0.0.1:8001:8001"]
+    read_only: true
+    tmpfs: ["/tmp:noexec,nosuid,size=32m"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    pids_limit: 128
+    networks: ["backend", "outbound"]
+    depends_on: ["api"]
   db:
     image: postgres:16
     environment:
@@ -19,5 +44,10 @@ services:
       interval: 5s
       retries: 12
     volumes: ["pgdata:/var/lib/postgresql/data"]
+    networks: ["backend"]
 volumes:
   pgdata:
+networks:
+  backend:
+    internal: true
+  outbound: {}

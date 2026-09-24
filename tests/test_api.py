@@ -49,6 +49,25 @@ class WorkflowTest(unittest.TestCase):
   self.req('POST',f'/prospects/{pid}/contact-review',json={'source_url':'https://directory.example/acme'})
   self.assertEqual(self.req('POST',f'/prospects/{pid}/draft').status_code,400)
   with self.assertRaises(ProjectHuntError): validate_public_url('http://127.0.0.1/')
+ def test_audit_reservation_and_durable_limit(self):
+  from projecthunt.service import MAX_AUDITS_PER_HOUR
+  rows='name,website,source_url\n'+''.join(f'Test{i},https://site{i}.example,https://directory.example/{i}\n' for i in range(MAX_AUDITS_PER_HOUR+1))
+  self.assertEqual(self.svc.import_csv(rows)['imported'],MAX_AUDITS_PER_HOUR+1)
+  ids=[p['id'] for p in self.svc.prospects()]
+  for pid in ids[:MAX_AUDITS_PER_HOUR]:self.svc.reserve_audit(pid)
+  with self.assertRaisesRegex(ProjectHuntError,'limit'):self.svc.reserve_audit(ids[-1])
+  self.svc.fail_audit(ids[0],'timeout')
+  self.assertEqual(self.svc.get(ids[0])['status'],'Discovered')
+  with self.assertRaisesRegex(ProjectHuntError,'limit'):self.svc.reserve_audit(ids[0])
+ def test_api_throttle(self):
+  from projecthunt.api import _requests
+  _requests.clear()
+  try:
+   for _ in range(120):self.assertEqual(self.req('GET','/performance').status_code,200)
+   limited=self.req('GET','/performance')
+   self.assertEqual(limited.status_code,429)
+   self.assertEqual(limited.headers['Retry-After'],'60')
+  finally:_requests.clear()
 if __name__=='__main__': unittest.main()
 
 class PostgresTest(unittest.TestCase):
