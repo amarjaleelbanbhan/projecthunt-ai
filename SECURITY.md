@@ -1,0 +1,3 @@
+# Security
+
+Report security issues privately through GitHub security advisories once the repository is public. Do not commit API keys, real customer records, or correspondence. The API requires one bearer key and binds to localhost in Compose. Plugin key files must be mode 0600 in the plugin's private data directory. Every website is untrusted input; audit requests block redirects, nonpublic DNS results and bodies over 1 MB. DNS rebinding remains possible; do not expose this service or its audit endpoint to untrusted users until egress is isolated and DNS answers are pinned. The source URL recorded for a contact reflects operator attestation, not independent verification.
